@@ -34,10 +34,8 @@ void offsetUVs(const float uv[2], float offset_uv[2])
         offset_uv[1] = v - UV_OFFSET_HALF;
         return;
     }
-
     if ( v < u && v <w)
     {
-        
         offset_uv[0] = u - UV_OFFSET_HALF;
         offset_uv[1] = v + UV_OFFSET;
         return;
@@ -47,8 +45,55 @@ void offsetUVs(const float uv[2], float offset_uv[2])
     offset_uv[1] = v - UV_OFFSET_HALF;
 
 }
+void offsetUVsNoBranch3(const float uv[2], float offset_uv[2])
+{
+    //ref to make life easier should boil down to no op, compiler
+    //will optimize it away
+    const float& u = uv[0];
+    const float& v = uv[1];
 
- 
+
+    //building the mask
+    float w = 1.0f - (u + v);
+    int isu = (u<v) & (u<w);
+    int isv = (v<u) & (v <w);
+    int isw = !(isu | isv);
+
+    offset_uv[0] = u + (isu * UV_OFFSET) + (isv * UV_OFFSET_HALF_AVX) + (isw * UV_OFFSET_HALF_AVX); 
+    offset_uv[1] = v + (isu * UV_OFFSET_HALF_AVX) + (isv * UV_OFFSET) + (isw * UV_OFFSET_HALF_AVX); 
+}
+
+void offsetUVsNoBranch1(const float uv[2], float offset_uv[2])
+{
+    //ref to make life easier should boil down to no op, compiler
+    //will optimize it away
+    const float& u = uv[0];
+    const float& v = uv[1];
+
+    __m128d uvd =  _mm_loadu_pd(reinterpret_cast<const double*>(uv));
+    __m256d uvreg  = _mm256_broadcastsd_pd(uvd);
+    
+    __m256 offset = _mm256_loadu_ps(off_buff);
+    __m256 to_be_masked =  _mm256_add_ps(_mm256_castpd_ps(uvreg),offset);
+
+    //building the mask
+    float w = 1.0f - (u + v);
+    int isu = (u<v) & (u <w);
+    int isv = (v<u) & (v <w);
+    int isw = !(isu | isv);
+    
+    uint32_t shufmask[8];
+    shufmask[0] =  3*isv + 5*isw;
+    shufmask[1] = shufmask[0]+1;
+    __m256i shufmaskreg = _mm256_load_si256(reinterpret_cast<const __m256i*>(shufmask));
+    __m256 res = _mm256_permutevar8x32_ps(to_be_masked, shufmaskreg);
+
+    
+    __m256i storemaskreg =  _mm256_loadu_si256(reinterpret_cast<const __m256i*>(storemask));
+    _mm256_maskstore_ps(offset_uv,storemaskreg,res);
+}
+
+
 inline __m256 compress256(__m256 src, unsigned int mask /* from movmskps */)
 {
     //mask is a interger on which each bit, represent wheter or not we should keep the result.
@@ -63,7 +108,7 @@ inline __m256 compress256(__m256 src, unsigned int mask /* from movmskps */)
     //based on the mask, so the result should be the indices we need compacted
     //on the lower side, which will we use later to get the values we need
     uint64_t wanted_indices = _pext_u64(identity_indices, expanded_mask);
-
+    
     //convertes 64 bits to a 128 register, zeroing out upper 64 register
     __m128i bytevec = _mm_cvtsi64_si128(wanted_indices);
     //expands a each byte to a 32 bit
@@ -76,6 +121,7 @@ inline __m256 compress256(__m256 src, unsigned int mask /* from movmskps */)
 //https://godbolt.org/g/FYgupd
 //https://godbolt.org/g/9I0H24
 //http://stackoverflow.com/questions/36932240/avx2-what-is-the-most-efficient-way-to-pack-left-based-on-a-mask
+
 void offsetUVsNoBranch2(const float uv[2], float offset_uv[2])
 {
     //ref to make life easier should boil down to no op, compiler
@@ -91,23 +137,22 @@ void offsetUVsNoBranch2(const float uv[2], float offset_uv[2])
 
     //building the mask
     float w = 1.0f - (u + v);
-    int isu = u<v && u<w;
-    int isv = v<u && v <w;
-    int isw = !(isu || isv);
+    int isu = (u<v) & (u<w);
+    int isv = (v<u) & (v <w);
+    int isw = !(isu | isv);
     
     //extending bool and orring rather then mult and add?
-    unsigned int m =3*isu + 12*isv + 48*isw;
+    uint32_t m =3*isu + 12*isv + 48*isw;
     __m256 res = compress256(to_be_masked, m);
     
     __m256i storemaskreg =  _mm256_loadu_si256(reinterpret_cast<const __m256i*>(storemask));
     _mm256_maskstore_ps(offset_uv,storemaskreg,res);
 }
-
 int main()
 {
     float uv[2];
     float uvoff[2];
-    const uint32_t ITERATIONS = 1000000;
+    const uint32_t ITERATIONS = 100000000;
     
     auto br1 = chrono::high_resolution_clock::now();
     for (uint32_t i=0; i< ITERATIONS; ++i)
@@ -120,18 +165,41 @@ int main()
     auto brt = chrono::duration_cast<chrono::microseconds>(br2 - br1).count();
     std::cout <<"with branch: "<< brt<<" micro" <<std::endl;
 
-
-
     auto nbr1 = chrono::high_resolution_clock::now();
+    for (uint32_t i=0; i< ITERATIONS; ++i)
+    {
+        uv[0] = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
+        uv[1] = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
+        offsetUVsNoBranch1(uv,uvoff);
+    }
+    auto nbr2 = chrono::high_resolution_clock::now();
+    auto nbrt = chrono::duration_cast<chrono::microseconds>(nbr2 - nbr1).count();
+    std::cout << "branchless:  "<<nbrt<<" micro"<<std::endl;
+    std::cout << "difference: " <<(int) ((1.0f - float(nbrt)/float(brt))*100.0f)<<"%"<<std::endl;
+
+
+    nbr1 = chrono::high_resolution_clock::now();
     for (uint32_t i=0; i< ITERATIONS; ++i)
     {
         uv[0] = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
         uv[1] = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
         offsetUVsNoBranch2(uv,uvoff);
     }
-    auto nbr2 = chrono::high_resolution_clock::now();
-    auto nbrt = chrono::duration_cast<chrono::microseconds>(nbr2 - nbr1).count();
-    std::cout << "branchless:  "<<nbrt<<" micro"<<std::endl;
+    nbr2 = chrono::high_resolution_clock::now();
+    nbrt = chrono::duration_cast<chrono::microseconds>(nbr2 - nbr1).count();
+    std::cout << "branchlessBMI:  "<<nbrt<<" micro"<<std::endl;
+    std::cout << "difference: " <<(int) ((1.0f - float(nbrt)/float(brt))*100.0f)<<"%"<<std::endl;
+
+    nbr1 = chrono::high_resolution_clock::now();
+    for (uint32_t i=0; i< ITERATIONS; ++i)
+    {
+        uv[0] = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
+        uv[1] = static_cast <float> (rand()) / static_cast <float> (RAND_MAX);
+        offsetUVsNoBranch3(uv,uvoff);
+    }
+    nbr2 = chrono::high_resolution_clock::now();
+    nbrt = chrono::duration_cast<chrono::microseconds>(nbr2 - nbr1).count();
+    std::cout << "branchlessNoAVX:  "<<nbrt<<" micro"<<std::endl;
     std::cout << "difference: " <<(int) ((1.0f - float(nbrt)/float(brt))*100.0f)<<"%"<<std::endl;
     return 0;
 }
